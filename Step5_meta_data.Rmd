@@ -1,0 +1,231 @@
+---
+title: "R codes for the NutNet-Stability project"
+subtitle: "Step5: meta data"
+author: "Qiang Yang"
+date: "`r Sys.Date()`"
+header-includes:
+- \usepackage{fancyhdr}
+- \pagestyle{fancy}
+- \fancyhead[CO,CE]{}
+- \fancyfoot[CO,CE]{R codes for the NutNet-stability project}
+- \fancyfoot[LE,RO]{\thepage}
+output: pdf_document
+classoption: landscape
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+**make a table describing the meta data of each sampling sites**
+```{r, warning=FALSE, message=FALSE, eval=TRUE, highlight=T, fig.width=7, fig.height=4}
+library(tidyverse)
+load(paste0(getwd(), "/mydata/df.tidy.Rdata"))
+load(paste0(getwd(), "/mydata/df.tidy.stabilities.Rdata"))
+
+# I later find there is one site only including control plots, remove it from df.tidy
+df.tidy <- df.tidy %>% filter(site_code != "cereep.fr")
+
+df.tidy %>% filter(trt %in% c("Control", "N", "P", "K")) %>% select(site_code, block, trt, plot) %>% n_distinct() #685
+df.tidy %>% filter(trt %in% c("N", "P", "K")) %>% select(site_code, block, trt, plot) %>% n_distinct()#500
+df.tidy.stabilities %>% filter(trt %in% c("N", "P", "K")) %>% select(site_code, block, trt, plot) #500 n_distinct()
+
+# the geographic location of each site
+df.location <- df.tidy %>% 
+  select(site_code, latitude, longitude) %>% 
+  distinct()
+
+# number of plots each site
+df.n.plots <- df.tidy %>% 
+  select(site_code, block, plot, trt) %>% 
+  distinct() %>% 
+  count(site_code, trt)
+df.n.plots <- df.n.plots %>% 
+  pivot_wider(names_from = trt, values_from = n)
+df.n.plots <- df.n.plots %>% 
+  mutate(n.plots.chr = pmap_chr(list(K, N, P), function(x1, x2, x3) paste0("K (", x1, "); ", "N (", x2, "); ","P (", x3, ")")),
+         n.plots.num = pmap_chr(list(K, N, P), function(x1, x2, x3)sum(x1,x2,x3, na.rm = T))) %>% 
+  mutate(n.plots = paste0("Total (", n.plots.num, "); ", n.plots.chr))
+df.n.plots <- df.n.plots %>% 
+  select(site_code, n.plots) %>% 
+  mutate(n.plots = str_replace_all(n.plots, "NA", "0"))
+
+# number of years of each site
+# most sites have the same sampling years for different treatments, so year information was only shown at the site level
+df.n.years <- df.tidy %>% 
+  unnest(cols = coverage.data) %>% 
+  select(site_code, year) %>% 
+  distinct() %>% 
+  group_by(site_code) %>% 
+  nest() %>% 
+  mutate(min.year = map_dbl(data, function(dt)min(dt$year)),
+         max.year = map_dbl(data, function(dt)max(dt$year))) %>% 
+  select(-data) %>% 
+  ungroup()
+# No cover data for barta.us, so need to use biomass data for it
+df.n.years <- df.n.years %>% filter(site_code != "barta.us")
+df.n.years.barta <- df.tidy %>% 
+  filter(site_code == "barta.us") %>% 
+  unnest(cols = biomass.data) %>% 
+  select(site_code, year) %>% 
+  distinct() %>% 
+  group_by(site_code) %>% 
+  nest() %>% 
+  mutate(min.year = map_dbl(data, function(dt)min(dt$year)),
+         max.year = map_dbl(data, function(dt)max(dt$year))) %>% 
+  select(-data) %>% 
+  ungroup()
+df.n.years <- df.n.years %>% 
+  bind_rows(df.n.years.barta) %>% 
+  mutate(sampling.years = paste(min.year, max.year, sep = "-")) %>% 
+  select(-min.year, -max.year)
+
+df.meta <- df.location %>% 
+  left_join(df.n.years) %>% 
+  left_join(df.n.plots) 
+
+colnames(df.meta) <- c("Site Code", "Latitude", "Longitude", "Sampling Years", "Number of Plots")
+
+df.meta <- df.meta %>% 
+  arrange(`Site Code`) %>% 
+  mutate_at(c("Latitude","Longitude"), function(x)as.character(round(x, digits = 2)))
+
+library(flextable)
+library(officer)
+myft <- flextable(df.meta)
+myft <- theme_booktabs(myft)
+myft <- autofit(myft)
+myft <- align(myft, i = 1, part = "header", align = "left")
+myft <- set_caption(myft, 
+                    caption = "Supplementary Table X | The NutNet sites included in this study. Columns from left to right represent the code of the site, the latitude of the site, the longitude of the site, the sampling years during which the species cover data was used to quantify stability components, the number of plots of the site and each nutrient treatment.")
+
+doc.path <- paste0(getwd(), "/mymanuscript/site.info.table.docx")
+save_as_docx(myft, path = doc.path)
+```
+
+**some codes on checking how many sites, blocks and plots are in the decoupling analysis and how many are in high or low perturbation groups**
+
+```{r, warning=FALSE, message=FALSE, eval=TRUE, highlight=T, fig.width=7, fig.height=4}
+load(paste0(data.path, "/df.tidy.stabilities.Rdata"))
+load(paste0(data.path, "/df.tidy.Rdata"))
+df.full <- df.tidy.stabilities %>%
+  left_join(df.tidy %>% select(-contains("data")))
+rm(df.tidy, df.tidy.stabilities)
+
+
+df.full %<>%
+  select(site_code:end_year, matches("_added_proportion|change|var"))
+sta.names <- colnames(df.full) %>% str_subset("change|var")
+
+# For the PCA analysis, all stability components need to be available for each row
+# no NA, no infinite
+# remove the relevant cases
+df.full <- df.full %>% 
+  filter_all(all_vars(!is.infinite(.))) %>% 
+  filter_all(all_vars(!is.na(.)))
+
+df.stability <- df.full
+
+# scale stability components
+df.stability %<>% mutate(across(one_of(sta.names), scale))
+
+
+# make a meta data for multidimensionality analysis
+trt.set <- c("N", "P", "K")
+final.year.set <- 9 # original using 5:9
+df.meta <- crossing(trt.set, final.year.set)
+
+## add data, nested by year
+
+df.meta <- df.meta %>%
+  mutate(data = map2(
+    trt.set, final.year.set,
+    function(x1, x2) {
+      plots.to.keep <- df.stability %>%
+        filter(
+          trt == x1,
+          end_year == x2
+        ) %>%
+        select(site_code, block, trt, plot)
+      subdat <- df.stability %>%
+        semi_join(plots.to.keep) %>%
+        filter(
+          trt == x1,
+          end_year <= x2
+        )
+      return(subdat)
+    }
+  ))
+df.meta %<>% ungroup()
+
+## add data, nested by perturbation intensity and end_year
+
+df.meta <- df.meta %>%
+  mutate(data2 = map2(
+    trt.set, data,
+    function(x1, dat) {
+      df.pert <- dat %>%
+        select(site_code, block, trt, plot, paste0(x1, "_added_proportion")) %>%
+        distinct() %>%
+        set_colnames(c("site_code", "block", "trt", "plot", "PI"))
+      df.pert %<>%
+        mutate(PI.group = ifelse(PI > median(PI), "High", "Low"))
+      dat %<>% left_join(df.pert)
+      dat.nested <- dat %>%
+        group_by(end_year, PI.group) %>%
+        nest() %>%
+        ungroup()
+      return(dat.nested)
+    }
+  ))
+
+df.meta %<>%
+  select(-data) %>%
+  unnest(cols = data2)
+df <- df.meta %>% select(trt.set, PI.group, data) %>% unnest(cols = data)
+n_distinct(df$site_code) # how many sites
+df %>% select(trt.set, PI.group, site_code) %>% distinct() %>% write_csv(file = "site_grouping_according_to_perturbation.csv")
+df %>% select(trt.set, PI.group, site_code,block, plot) %>% distinct() %>% write_csv(file = "plots_grouping_according_to_perturbation.csv")
+```
+
+
+
+
+
+# make a map of the finally selected sites that are included in the analysis
+
+
+```{r, warning=FALSE, message=FALSE, eval=T, highlight=T, prompt=TRUE}
+sites <- df.location
+
+# Load world map
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Convert site data to an sf object
+sites_sf <- st_as_sf(sites, coords = c("longitude", "latitude"), crs = 4326)
+
+# Create the map
+(
+  p.map <- ggplot(data = world) +
+    geom_sf(fill = "gray85", color = "gray20", size = 0.1) + # Clean world map
+    geom_sf(data = sites_sf, color = "red", size = 2, shape = 1, fill = "red") + # Site points
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white", color = NA), # Clean background
+      panel.grid.major = element_blank(), # Remove major grid lines
+      panel.grid.minor = element_blank(), # Remove minor grid lines
+      axis.text = element_blank(), # Remove axis text
+      axis.title = element_blank(), # Remove axis titles
+      axis.ticks = element_blank(), # Remove axis ticks
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+      plot.subtitle = element_text(hjust = 0.5, size = 12),
+      plot.caption = element_text(hjust = 0.5, size = 10)
+    )
+)
+ggsave(
+  filename = paste0(getwd(), "/myfigure/selected sites.pdf"),
+  width = 4,
+  height = 3
+)
+```

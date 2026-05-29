@@ -1,0 +1,315 @@
+---
+title: "R codes for the NutNet-Stability project"
+subtitle: "Step3: Analysis on single stability components"
+author: "Qiang Yang"
+date: "`r Sys.Date()`"
+header-includes:
+- \usepackage{fancyhdr}
+- \pagestyle{fancy}
+- \fancyhead[CO,CE]{}
+- \fancyfoot[CO,CE]{R codes for the NutNet-stability project}
+- \fancyfoot[LE,RO]{\thepage}
+output: pdf_document
+classoption: landscape
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+\newpage
+
+
+In this section, I conduct regression analysis on single stability components to see their response to nutrient enrichment and their dependence on time length.
+
+# Section 1: set up working environment 
+
+```{r, warning=FALSE, message=FALSE, eval=TRUE, highlight=T, fig.width=7, fig.height=4}
+rm(list = ls())
+gc()
+# necessary R packages
+Packages <- c(
+  "tidyverse", "magrittr", "grid", "gridExtra", 
+  "scales", "broom", "nlme", "sjPlot", "patchwork", "lme4", "lmerTest"
+)
+pacman::p_load(char = Packages)
+# functions with conflicting status (presence in different packages used here)
+select <- dplyr::select
+summarise <- dplyr::summarise
+
+# working path
+main.path <- getwd()
+data.path <- paste0(main.path, "/mydata")
+figure.path <- paste0(main.path, "/myfigure")
+set.seed(1234)
+```
+
+# Section 2 prepare data
+
+```{r, warning=FALSE, message=FALSE, eval=TRUE, highlight=T, fig.width=7, fig.height=4}
+load(paste0(data.path, "/df.tidy.stabilities.Rdata"))
+load(paste0(data.path, "/df.tidy.Rdata"))
+df.full <- df.tidy.stabilities %>%
+  left_join(df.tidy %>% select(-contains("data")))
+rm(df.tidy, df.tidy.stabilities)
+
+
+df.full %<>%
+  select(site_code:end_year, matches("_added_proportion|change|var"))
+sta.names <- colnames(df.full) %>% str_subset("change|var")
+
+# data for the treatments N, P, and K
+df.meta.N.P.K <- data.frame(trt = c("N", "P", "K")) %>%
+  mutate(pert.name = paste0(trt, "_added_proportion")) %>%
+  expand_grid(sta.names)
+
+df.N.P.K.nested <- df.meta.N.P.K %>%
+  mutate(
+    data = pmap(list(trt, pert.name, sta.names), function(x1, x2, x3) {
+      output <- df.full %>%
+        filter(trt == x1) %>%
+        select(one_of(c("site_code", "block", "plot", "end_year", x2, x3))) %>%
+        set_colnames(c("site_code", "block", "plot", "end_year", "perturbation_intensity", "stability"))
+    })
+  )
+
+# note that there will be missing data in the stability column 
+# this is due to the availability of cover data or biomass data for some plots
+# remove the NA values
+df.N.P.K.nested <- df.N.P.K.nested %>%
+  mutate(data = map(data, na.omit))
+# I also noted that there are infinite values in the stability column 
+#  remove them
+df.N.P.K.nested <- df.N.P.K.nested %>%
+  mutate(data = map(data, function(df1) df1 %>% filter(!is.infinite(stability))))
+```
+
+# Section 3 - sites as random intercept
+
+I run two sets of model. The first: using sites as random intercept; the second: using sites as both random intercept and random slopes.
+
+**3.1 perform the regression**
+```{r, warning=FALSE, message=FALSE,  highlight=T, fig.width=7, fig.height=4, eval=TRUE}
+df.models.N.P.K <- df.N.P.K.nested %>%
+  mutate(mod.out = map(data, function(dat) {
+    # log transform perturbation intensity
+    dat %<>% mutate(log.pert = log(perturbation_intensity))
+    dat %<>% na.omit()
+    mod.dat <- dat
+    mod.dat %<>% mutate(across(c(end_year, log.pert), scale))
+    formula_ <- stability ~ log.pert + end_year + log.pert:end_year + (1 | site_code)
+    mod <- lmer(formula = formula_, data = mod.dat)
+    return(mod)
+  }))
+```
+There is no convergence problem for this set of models.
+
+**3.2 organize model coefficient estimates and p values**
+
+```{r, warning=FALSE, message=FALSE,  highlight=T, fig.width=7, fig.height=4, eval=TRUE}
+df.models.N.P.K.coeffficients <- df.models.N.P.K %>%
+  mutate(mod.coefficient = map(mod.out, function(mod) {
+    # coefficient estimate from the summary function
+    output <- summary(mod)$coefficients
+    coeff <- output %>% as.data.frame()
+    coeff %<>% mutate(predictor = rownames(output))
+    coeff %<>% select(predictor, Estimate)
+    # confidence interval from lme4::confint.merMod()
+    # profile confidence intervals
+    cfs <- confint.merMod(mod)
+    cfs %<>% as.data.frame()
+    cfs %<>% mutate(predictor = rownames(cfs))
+    cfs %<>% rename(lcf = `2.5 %`, ucf = `97.5 %`)
+    cfs %<>% filter(!str_detect(predictor, ".sig"))
+    # P value from anova (lmerTest borrow from pkgtest)
+    df.p.value <- anova(mod) %>% as.data.frame()
+    df.p.value %<>% select(NumDF:`Pr(>F)`)
+    df.p.value %<>% mutate(predictor = rownames(df.p.value))
+
+    # add significance sign
+    coeff <- coeff %>%
+      left_join(cfs) %>%
+      left_join(df.p.value)
+    coeff %<>% filter(predictor != "(Intercept)")
+    coeff %<>%
+      mutate(sig.sign = map2_chr(Estimate, `Pr(>F)`, function(x, p) {
+        if (x < 0 & p < 0.05) {
+          out <- "negative"
+        } else if (x > 0 & p < 0.05) {
+          out <- "positive"
+        } else {
+          out <- "non-significant"
+        }
+        return(out)
+      }))
+    return(coeff)
+  }))
+
+
+df.models.N.P.K.coeffficients %<>%
+  mutate(model.ID = 1:nrow(df.models.N.P.K.coeffficients)) %>%
+  select(-pert.name, -data, -mod.out) %>%
+  select(model.ID, everything()) %>%
+  unnest(cols = mod.coefficient)
+```
+
+**3.3 visualize model coefficient estimates**
+
+```{r, warning=FALSE, message=FALSE, highlight=T, fig.width=7, fig.height=4, eval=TRUE}
+df.coefficients <- df.models.N.P.K.coeffficients %>%
+  mutate(predictor = str_replace_all(predictor, "end_year", "years")) %>%
+  mutate(predictor = str_replace_all(predictor, "log.pert", "perturbation"))
+stabilities <- df.coefficients %>%
+  select(sta.names) %>%
+  distinct() %>%
+  pull()
+df.coefficients %<>%
+  mutate(sta.names = as.factor(sta.names)) %>%
+  mutate(sta.names = fct_relevel(sta.names, stabilities)) %>%
+  mutate(trt = as.factor(trt)) %>%
+  mutate(trt = fct_relevel(trt, c("N", "P", "K"))) %>%
+  mutate(predictor = as.factor(predictor)) %>%
+  mutate(predictor = fct_relevel(predictor, c("years", "perturbation", "perturbation:years")))
+
+p1 <- df.coefficients %>%
+  # filter(str_detect(sta.names, "functional")) %>%
+  ggplot(aes(x = predictor, y = Estimate, color = sig.sign)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = lcf, ymax = ucf), width = .2) +
+  facet_grid(trt ~ sta.names, scales = "free") +
+  coord_flip() +
+  geom_hline(yintercept = 0, col = "grey", linetype = "dashed", size = 0.3) +
+  scale_color_manual(values = c("blue", "grey", "red")) +
+  theme_linedraw() +
+  theme(
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(color = "black", size = 8),
+    panel.grid = element_blank(),
+    axis.text.x = element_text(size = 9, color = "black", angle = 90),
+    axis.text.y = element_text(size = 10, color = "black"),
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_blank(),
+    plot.title = element_text(face = "bold", color = "blue"),
+    legend.position = "bottom",
+    legend.title = element_blank()
+  ) +
+  xlab("Predictors") +
+  ylab("The Coefficient Estimate")
+
+trt.labs <- c("+N", "+P", "+K")
+names(trt.labs) <- c("N", "P", "K")
+
+# Create the plot
+(p1 <- p1 + facet_grid(
+  trt ~ sta.names,
+  scales = "free",
+  labeller = labeller(trt = trt.labs)
+))
+
+# make a table for the coefficients
+data_table <- data.frame(lapply(df.coefficients, function(x) {
+  if (is.numeric(x)) round(x, 3) else x
+}))
+T1 <- tableGrob(data_table, rows = NULL)
+
+pdf(paste0(figure.path, "/lmm.coefficients_site.as.random.intercepts.pdf"), width = 6, height = 4)
+print(p1)
+dev.off()
+
+pdf(paste0(figure.path, "/table.lmm.coefficients_site.as.random.intercepts.pdf"), width = 13, height = 13)
+grid::grid.draw(T1)
+dev.off()
+```
+
+**3.4 visualize model prediction**
+
+I visualized the model predictions using sjPlot::plot_model(). uses the mean value of the moderator as well as one standard deviation below and above mean value to plot the effect of the moderator on the independent variable (following the convention suggested by Cohen and Cohen and popularized by Aiken and West (1991).
+```{r, warning=FALSE, message=FALSE, eval=TRUE, highlight=T, fig.width=5, fig.height=5}
+p.list <- list()
+df.models.N.P.K2 <- df.models.N.P.K
+
+# to make a range for the figures
+df.range <- df.full %>%
+  select(contains("var"), contains("change")) %>%
+  gather(key = "sta.names") %>%
+  na.omit()
+df.range <- df.range %>% filter(!is.infinite(value))
+df.range <- df.range %>%
+  group_by(sta.names) %>%
+  summarise(
+    y.min = quantile(value, 0.05),
+    y.max = quantile(value, 0.95)
+  ) %>%
+  ungroup()
+
+df.models.N.P.K2 <- df.models.N.P.K2 %>% left_join(df.range)
+
+# df.models.N.P.K2 %<>% filter(str_detect(sta.names, "Functional"))
+for (i in 1:15) {
+  mod <- df.models.N.P.K2$mod.out[[i]]
+  p <- plot_model(mod, type = "int", mdrt.values = "meansd", line.size = 1.5) +
+    theme_classic() +
+    scale_color_manual(values = c("blue", "black", "red")) +
+    scale_fill_manual(values = c("blue", "black", "red")) +
+    ylim(c(df.models.N.P.K2$y.min[[i]], df.models.N.P.K2$y.max[[i]])) +
+    xlab(paste0("Perturbation intensity (+", df.models.N.P.K2$trt[[i]], ")")) +
+    ylab(df.models.N.P.K2$sta.names[[i]]) +
+    ggtitle("") +
+    theme(axis.text = element_text(color = "black"))
+  p.list[[i]] <- p
+}
+
+# + N
+Fig <- wrap_plots(p.list[[2]], p.list[[3]], p.list[[4]], p.list[[5]], nrow = 2, ncol = 2)
+(Fig <- Fig +
+  plot_annotation(tag_levels = "a") +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom", legend.title = element_blank()))
+
+pdf(paste0(getwd(), "/myfigure/lmm.predictions.N.pdf"), width = 5, height = 5)
+Fig
+dev.off()
+# + P
+Fig <- wrap_plots(p.list[[7]], p.list[[8]], p.list[[9]], p.list[[10]], nrow = 2, ncol = 2)
+(Fig <- Fig +
+  plot_annotation(tag_levels = "a") +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom", legend.title = element_blank()))
+
+pdf(paste0(getwd(), "/myfigure/lmm.predictions.P.pdf"), width = 5, height = 5)
+Fig
+dev.off()
+# + K
+Fig <- wrap_plots(p.list[[12]], p.list[[13]], p.list[[14]], p.list[[15]], nrow = 2, ncol = 2)
+(Fig <- Fig +
+  plot_annotation(tag_levels = "a") +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom", legend.title = element_blank()))
+
+pdf(paste0(figure.path, "/lmm.predictions.K.pdf"), width = 5, height = 5)
+Fig
+dev.off()
+```
+
+Also make a figure for func_var.
+
+```{r, warning=FALSE, message=FALSE, eval=TRUE, highlight=T, fig.width=6, fig.height=3}
+Fig <- wrap_plots(p.list[[2]], p.list[[7]], p.list[[12]], nrow = 1, ncol = 3)
+(Fig <- Fig +
+  plot_annotation(tag_levels = "a") +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom", legend.title = element_blank()))
+
+pdf(paste0(figure.path, "/lmm.predictions.func_var.pdf"), width = 6, height = 3)
+Fig
+dev.off()
+```
+
+Also make a figure for the ones where the interaction between time and perturbation intensity is significant.
+
+```{r, warning=FALSE, message=FALSE, eval=TRUE, highlight=T, fig.width=6, fig.height=3}
+Fig <- wrap_plots(p.list[[2]], p.list[[4]], p.list[[8]], nrow = 1, ncol = 3)
+(Fig <- Fig +
+  plot_annotation(tag_levels = "a") +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom", legend.title = element_blank()))
+
+pdf(paste0(figure.path, "/lmm.predictions.significant.interaction.pdf"), width = 6, height = 3)
+Fig
+dev.off()
+```
